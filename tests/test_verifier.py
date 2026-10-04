@@ -1,5 +1,6 @@
 """Unit tests for the JVM type-state verifier."""
 import os
+import struct
 import sys
 import unittest
 
@@ -208,6 +209,92 @@ class LegalPathTests(unittest.TestCase):
         res = verify_class(b.build())
         self.assertTrue(res["ok"], res.get("error"))
 
+    def test_tableswitch_passes_and_frames_reach_both_returns(self):
+        # Regression: a spec-aligned tableswitch (0xAA) at offset 1 was
+        # rejected as unknown-opcode at its padding byte, so a legal static
+        # ()V method could not pass. iconst_0 feeds the switch; case 0 and
+        # default each jump to their own return.
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)                       # 0 iconst_0
+        a.tableswitch("ret_default", ["ret_case0"])
+        a.label("ret_case0")             # 20
+        a.op(0xB1)                       # 20 return
+        a.label("ret_default")           # 21
+        a.op(0xB1)                       # 21 return
+        self.assertEqual(a.pc, 22)       # tableswitch spans offsets 1..19
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+
+        # the switch is decoded at its real start, not as an opcode at 1
+        sw = state_at(res, 1)
+        self.assertTrue(sw["insn"].startswith("tableswitch"))
+        self.assertEqual(sw["stack"], ["int"])
+
+        # the consumed-control frame propagated to both return branches
+        case_ret = state_at(res, 20)
+        default_ret = state_at(res, 21)
+        self.assertTrue(case_ret["reachable"])
+        self.assertTrue(default_ret["reachable"])
+        self.assertEqual(case_ret["insn"], "return")
+        self.assertEqual(default_ret["insn"], "return")
+        self.assertEqual(case_ret["stack"], [])
+        self.assertEqual(default_ret["stack"], [])
+
+    def test_tableswitch_one_byte_and_zero_padding(self):
+        # Padding is (4 - (pc + 1) % 4) % 4. The acceptance case above has the
+        # opcode at pc=1 (two pad bytes); here exercise the other alignments.
+
+        # pc=2 -> one padding byte: bipush occupies offsets 0-1, so the
+        # tableswitch operands land at offset 4 with one pad byte at 3.
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x10, 0x01)                   # 0 bipush 1
+        a.tableswitch("ret_default",
+                      ["ret_case", "ret_case", "ret_case"])  # keys 0..2
+        a.label("ret_case")
+        a.op(0xB1)
+        a.label("ret_default")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+
+        # pc=3 -> zero padding bytes: operands start immediately at offset 4.
+        b2 = ClassBuilder()
+        a2 = Asm()
+        a2.op(0x03)                        # 0 iconst_0
+        a2.op(0x3B)                        # 1 istore_0
+        a2.op(0x1A)                        # 2 iload_0
+        a2.tableswitch("ret_default2", ["ret_case2"])  # 3 tableswitch
+        a2.label("ret_case2")
+        a2.op(0xB1)
+        a2.label("ret_default2")
+        a2.op(0xB1)
+        b2.add_method("run", a2.build(), max_stack=1, max_locals=1)
+        res2 = verify_class(b2.build())
+        self.assertTrue(res2["ok"], res2.get("error"))
+
+    def test_tableswitch_nonzero_low_keys(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)                       # 0 iconst_0
+        a.tableswitch("ret_default",
+                      ["ret_5", "ret_6"], low=5)
+        a.label("ret_5")
+        a.op(0xB1)
+        a.label("ret_6")
+        a.op(0xB1)
+        a.label("ret_default")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+        sw = state_at(res, 1)
+        self.assertIn("5->", sw["insn"])
+        self.assertIn("6->", sw["insn"])
+
 
 class RejectionTests(unittest.TestCase):
     def test_uninitialized_local_escapes_to_handler(self):
@@ -266,6 +353,67 @@ class RejectionTests(unittest.TestCase):
         self.assertEqual(res["error"]["kind"], "bad-branch-target")
         self.assertEqual(res["error"]["offset"], 0)
         self.assertIn("offset 4", res["error"]["message"])
+
+    def test_tableswitch_target_into_padding_rejected(self):
+        # Switch at offset 1; case 0 jumps to offset 2, which is a padding
+        # byte rather than an instruction boundary.
+        code = bytearray()
+        code += b"\x03"                       # 0 iconst_0
+        code += b"\xAA\x00\x00"               # 1 tableswitch + padding
+        code += struct.pack(">iii", 19, 0, 0)  # default ->20, low 0, high 0
+        code += struct.pack(">i", 1)          # case 0 -> 2 (padding byte)
+        code += b"\xB1"                       # 20 return
+        b = ClassBuilder()
+        b.add_method("run", bytes(code), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-branch-target")
+        self.assertEqual(res["error"]["offset"], 1)
+
+    def test_tableswitch_stack_underflow_rejected(self):
+        # The switch is the first instruction with an empty stack.
+        code = bytearray()
+        code += b"\xAA\x00\x00\x00"           # 0 tableswitch, operands at 4
+        code += struct.pack(">iii", 16, 0, 0)  # default ->20, low 0, high 0
+        code += struct.pack(">i", 16)         # case 0 -> 20
+        code += b"\xB1"                       # 20 return
+        b = ClassBuilder()
+        b.add_method("run", bytes(code), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "stack-underflow")
+        self.assertEqual(res["error"]["offset"], 0)
+
+    def test_tableswitch_truncated_rejected(self):
+        b = ClassBuilder()
+        # operands would start at offset 4; only the default word is present
+        code = b"\xAA\x00\x00\x00" + struct.pack(">i", 16)
+        b.add_method("run", code, max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "truncated-instruction")
+        self.assertEqual(res["error"]["offset"], 0)
+
+    def test_tableswitch_bad_low_high_rejected(self):
+        b = ClassBuilder()
+        code = b"\xAA\x00\x00\x00"
+        code += struct.pack(">iii", 16, 5, 2)  # default, low=5 > high=2
+        b.add_method("run", code, max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-switch-range")
+        self.assertEqual(res["error"]["offset"], 0)
+
+    def test_tableswitch_missing_case_offsets_rejected(self):
+        b = ClassBuilder()
+        code = b"\xAA\x00\x00\x00"
+        # low=0 high=2 declares three case offsets but none follow
+        code += struct.pack(">iii", 0, 0, 2)
+        b.add_method("run", code, max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "truncated-instruction")
+        self.assertEqual(res["error"]["offset"], 0)
 
     def test_truncated_file_rejected(self):
         data = legal_construction_class()

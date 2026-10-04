@@ -110,6 +110,25 @@ class Asm:
         self.buf += b"\x00" * width
         return self
 
+    def tableswitch(self, default_label, case_labels, low=0):
+        """Emit 0xAA with spec-aligned operands: 0-3 pad bytes so the
+        default/low/high words start on a 4-byte boundary from the method
+        start, then one 4-byte branch fixup per case (case_labels[i] is the
+        target for key low+i)."""
+        insn = len(self.buf)
+        self.buf.append(0xAA)
+        operands_at = (len(self.buf) + 3) & ~3
+        self.buf += b"\x00" * (operands_at - len(self.buf))
+        self.fixups.append((len(self.buf), insn, default_label, 4))
+        self.buf += b"\x00" * 4  # default
+        high = low + len(case_labels) - 1
+        self.buf += low.to_bytes(4, "big", signed=True)
+        self.buf += high.to_bytes(4, "big", signed=True)
+        for label in case_labels:
+            self.fixups.append((len(self.buf), insn, label, 4))
+            self.buf += b"\x00" * 4
+        return self
+
     def build(self):
         for pos, insn, label, width in self.fixups:
             off = self.labels[label] - insn

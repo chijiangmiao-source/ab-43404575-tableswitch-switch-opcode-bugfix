@@ -29,7 +29,7 @@
 
 - 目标方法：静态 `()V`（多个时需用 `method` 字段指定）；无字段访问；
 - 指令集：常量（`iconst`/`bipush`/`sipush`/`ldc`）、`iload/aload/istore/astore` 系列、
-  `iinc`、int 运算、`pop/dup`、分支（`if*`/`goto`/`goto_w`）、`new`、
+  `iinc`、int 运算、`pop/dup`、分支（`if*`/`goto`/`goto_w`/`tableswitch`）、`new`、
   `invokespecial <init>`、`athrow`、`return`、异常表；
 - 越出范围的指令 / 常量按 `unknown-opcode` / `unsupported-*` 拒绝并定位偏移。
 
@@ -64,7 +64,8 @@
 `incompatible-types`、`uninitialized-escapes-to-handler`、
 `uninitialized-object-used`、`already-initialized`、`stack-underflow` /
 `stack-overflow`、`local-index-out-of-range`、`fall-off-end`、
-`unknown-opcode`、`non-converging`、`no-target-method` / `ambiguous-method`。
+`unknown-opcode`、`bad-switch-range`、`non-converging`、
+`no-target-method` / `ambiguous-method`。
 
 ## 运行（Docker Compose）
 
@@ -85,7 +86,7 @@ HOST_PORT=9090 docker compose up app
 ## 本地开发（无 Docker）
 
 ```bash
-python3 -m unittest discover -s tests -v     # 47 个单元/API 测试
+python3 -m unittest discover -s tests -v     # 55 个单元/API 测试
 PORT=8080 python3 -m app.server &            # 启动服务
 APP_URL=http://127.0.0.1:8080 python3 verify/smoke.py   # 冒烟
 ```

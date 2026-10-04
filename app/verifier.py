@@ -173,6 +173,10 @@ _FORMATS = {
 _SIZES = {"b": 2, "u1": 2, "s2": 3, "cp1": 2, "cp2": 3, "iinc": 3,
           "br2": 3, "br4": 5}
 
+# tableswitch (0xAA): opcode + 0-3 padding bytes, then the 4-byte-aligned
+# default/low/high words and one 4-byte jump offset per case.
+TABLESWITCH = 0xAA
+
 
 def decode(code: bytes) -> dict:
     """Linear-sweep decode; every offset in `code` is covered exactly once."""
@@ -184,6 +188,11 @@ def decode(code: bytes) -> dict:
         if op in _SIMPLE:
             insns[off] = Insn(off, op, _SIMPLE[op], (), 1)
             off += 1
+            continue
+        if op == TABLESWITCH:
+            insn, size = _decode_tableswitch(code, off, n)
+            insns[off] = insn
+            off += size
             continue
         spec = _FORMATS.get(op)
         if spec is None:
@@ -217,6 +226,48 @@ def decode(code: bytes) -> dict:
         insns[off] = Insn(off, op, name, operands, size)
         off += size
     return insns
+
+
+def _decode_tableswitch(code: bytes, off: int, n: int):
+    """Decode a tableswitch; its operand block is 4-byte aligned from the
+    method start, so the padding length depends on the instruction offset.
+
+    operands = (default_offset, low, high, (case offsets...)); the jump
+    offsets are method-relative signed deltas, exactly as stored.
+    """
+    operands_at = (off + 4) & ~3
+    fixed = operands_at + 12  # default + low + high
+    if fixed > n:
+        raise VerifyError(
+            off, "truncated-instruction",
+            f"instruction tableswitch at offset {off} needs its 4-byte-aligned "
+            f"default/low/high words at offset {operands_at}, only {n - off} "
+            f"byte(s) remain in the code array")
+    default_off = int.from_bytes(code[operands_at:operands_at + 4],
+                                 "big", signed=True)
+    low = int.from_bytes(code[operands_at + 4:operands_at + 8], "big",
+                         signed=True)
+    high = int.from_bytes(code[operands_at + 8:operands_at + 12], "big",
+                          signed=True)
+    if high < low:
+        raise VerifyError(
+            off, "bad-switch-range",
+            f"tableswitch at offset {off} has low={low} greater than "
+            f"high={high}")
+    ncases = high - low + 1
+    end = fixed + 4 * ncases
+    if end > n:
+        raise VerifyError(
+            off, "truncated-instruction",
+            f"instruction tableswitch at offset {off} declares {ncases} "
+            f"case offset(s) ({low}..{high}) ending at offset {end}, only "
+            f"{n - off} byte(s) remain in the code array")
+    case_offs = tuple(
+        int.from_bytes(code[fixed + 4 * i:fixed + 4 * i + 4], "big",
+                       signed=True)
+        for i in range(ncases))
+    operands = (default_off, low, high) + case_offs
+    return Insn(off, TABLESWITCH, "tableswitch", operands, end - off), end - off
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +391,12 @@ def disasm(insn: Insn, cf: ClassFile) -> str:
         if n == "invokespecial":
             cls, name, desc = cp_methodref(cf, insn.operands[0], insn.offset)
             return f"invokespecial {cls}.{name}{desc}"
+        if n == "tableswitch":
+            default_delta, low, high, *case_deltas = insn.operands
+            parts = [f"default {insn.offset + default_delta}"]
+            parts.extend(f"{low + i}->{insn.offset + d}"
+                         for i, d in enumerate(case_deltas))
+            return "tableswitch " + " ".join(parts)
     except VerifyError:
         return f"{n} #{insn.operands[0]}"
     return n
@@ -511,6 +568,14 @@ class MethodVerifier:
                     f"instruction")
             return t
 
+        def switch_target(delta, label):
+            t = pc + delta
+            if t not in self.insns:
+                err("bad-branch-target",
+                    f"{n} {label} targets offset {t}, which is not the start "
+                    f"of an instruction")
+            return t
+
         def out():
             return Frame(tuple(locals_), tuple(stack))
 
@@ -625,6 +690,16 @@ class MethodVerifier:
             return via_branch()
         if n in ("goto", "goto_w"):
             return [(branch_target(), out())]
+
+        # -- switches
+        if n == "tableswitch":
+            pop_int()  # the control value is consumed; no value on the
+            f = out()  # post-consumption frame propagates to every branch
+            default_delta, low, high, *case_deltas = insn.operands
+            succs = [(switch_target(default_delta, "default"), f)]
+            succs.extend((switch_target(d, f"case {low + i}"), f)
+                         for i, d in enumerate(case_deltas))
+            return succs
 
         # -- object creation / initialization
         if n == "new":
