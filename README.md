@@ -29,8 +29,10 @@
 
 - 目标方法：静态 `()V`（多个时需用 `method` 字段指定）；无字段访问；
 - 指令集：常量（`iconst`/`bipush`/`sipush`/`ldc`）、`iload/aload/istore/astore` 系列、
-  `iinc`、int 运算、`pop/dup`、分支（`if*`/`goto`/`goto_w`）、`new`、
-  `invokespecial <init>`、`athrow`、`return`、异常表；
+  `iinc`、int 运算、`pop/dup`、分支（`if*`/`goto`/`goto_w`/`tableswitch`/`lookupswitch`）、
+  `new`、`invokespecial <init>`、`athrow`、`return`、异常表；
+  switch 的操作数块按规范对齐到 4 字节边界，消费一个 `int` 选择值后把帧传播到
+  各 case 与 default 目标（无 fall-through）；
 - 越出范围的指令 / 常量按 `unknown-opcode` / `unsupported-*` 拒绝并定位偏移。
 
 ## API
@@ -64,7 +66,8 @@
 `incompatible-types`、`uninitialized-escapes-to-handler`、
 `uninitialized-object-used`、`already-initialized`、`stack-underflow` /
 `stack-overflow`、`local-index-out-of-range`、`fall-off-end`、
-`unknown-opcode`、`non-converging`、`no-target-method` / `ambiguous-method`。
+`unknown-opcode`、`malformed-tableswitch` / `malformed-lookupswitch`、
+`non-converging`、`no-target-method` / `ambiguous-method`。
 
 ## 运行（Docker Compose）
 

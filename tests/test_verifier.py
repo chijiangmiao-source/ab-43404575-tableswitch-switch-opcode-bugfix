@@ -208,6 +208,79 @@ class LegalPathTests(unittest.TestCase):
         res = verify_class(b.build())
         self.assertTrue(res["ok"], res.get("error"))
 
+    def test_tableswitch_participates_in_verification(self):
+        # Regression: an aligned tableswitch following iconst_0 used to be
+        # rejected as unknown-opcode at offset 1, even though it is legal
+        # JVM control flow.  case 0 and default lead to separate returns;
+        # the frame after the int selector is consumed must propagate to
+        # both return offsets.
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)                      # 0 iconst_0
+        a.tableswitch("default", 0, ["case0"])  # 1 tableswitch (aligned)
+        case0_pc = a.pc
+        a.label("case0")
+        a.op(0xB1)                      # case0: return
+        default_pc = a.pc
+        a.label("default")
+        a.op(0xB1)                      # default: return
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+        sw = state_at(res, 1)
+        self.assertTrue(sw["insn"].startswith("tableswitch"))
+        self.assertEqual(sw["stack"], ["int"])
+        case0 = state_at(res, case0_pc)
+        default = state_at(res, default_pc)
+        self.assertEqual(case0["insn"], "return")
+        self.assertEqual(default["insn"], "return")
+        self.assertTrue(case0["reachable"])
+        self.assertTrue(default["reachable"])
+        # selector consumed: empty stacks propagated to both branches
+        self.assertEqual(case0["stack"], [])
+        self.assertEqual(default["stack"], [])
+        self.assertEqual(sw["insn"],
+                         f"tableswitch default->{default_pc} "
+                         f"[0->{case0_pc}]")
+
+    def test_tableswitch_multiple_cases_share_a_join(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x04)                      # 0 iconst_1
+        a.tableswitch("default", 0, ["c0", "c1", "c2"])  # 1
+        a.label("c0")                   # all three cases funnel into join
+        a.branch(0xA7, "join")
+        a.label("c1")
+        a.branch(0xA7, "join")
+        a.label("c2")
+        a.label("join")
+        a.op(0xB1)                      # join: return
+        default_pc = a.pc
+        a.label("default")
+        a.op(0xB1)                      # default: return
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertTrue(state_at(res, default_pc)["reachable"])
+
+    def test_lookupswitch_participates_in_verification(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)                      # 0 iconst_0
+        a.lookupswitch("default", [(7, "hit")])  # 1 lookupswitch (aligned)
+        hit_pc = a.pc
+        a.label("hit")
+        a.op(0xB1)                      # hit: return
+        default_pc = a.pc
+        a.label("default")
+        a.op(0xB1)                      # default: return
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertTrue(state_at(res, hit_pc)["reachable"])
+        self.assertTrue(state_at(res, default_pc)["reachable"])
+        self.assertIn("7->", state_at(res, 1)["insn"])
+
 
 class RejectionTests(unittest.TestCase):
     def test_uninitialized_local_escapes_to_handler(self):
@@ -414,6 +487,57 @@ class RejectionTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(res["error"]["kind"], "truncated-instruction")
         self.assertEqual(res["error"]["offset"], 0)
+
+    def test_tableswitch_underflow_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.tableswitch("d", 0, ["c"])
+        a.label("c")
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "stack-underflow")
+        self.assertEqual(res["error"]["offset"], 0)
+
+    def test_tableswitch_non_int_selector_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x01)                      # 0 aconst_null
+        a.tableswitch("d", 0, ["c"])   # 1 expects int, finds null
+        a.label("c")
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "type-mismatch")
+        self.assertEqual(res["error"]["offset"], 1)
+
+    def test_tableswitch_target_into_padding_rejected(self):
+        # Raw encoding: tableswitch at pc 1; default branch targets pc 2,
+        # which lies inside the switch padding, not an instruction start.
+        code = bytearray()
+        code += b"\x03"                  # 0 iconst_0
+        code += b"\xAA"                  # 1 tableswitch
+        code += b"\x00\x00"              # padding to a 4-byte boundary
+        code += (1).to_bytes(4, "big", signed=True)   # default -> pc 2
+        code += (0).to_bytes(4, "big", signed=True)   # low
+        code += (0).to_bytes(4, "big", signed=True)   # high
+        code += (19).to_bytes(4, "big", signed=True)  # case 0 -> pc 20
+        assert len(code) == 20
+        code += b"\xB1"                  # 20 return
+        code += b"\xB1"                  # 21 return (unreachable default)
+        b = ClassBuilder()
+        b.add_method("run", bytes(code), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-branch-target")
+        self.assertEqual(res["error"]["offset"], 1)
+        self.assertIn("offset 2", res["error"]["message"])
 
     def test_empty_code_rejected(self):
         b = ClassBuilder()

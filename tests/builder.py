@@ -110,6 +110,42 @@ class Asm:
         self.buf += b"\x00" * width
         return self
 
+    def _switch_pad(self, opcode):
+        insn = len(self.buf)
+        self.buf.append(opcode)
+        # JVMS: zero padding so the operand block starts at a code offset
+        # that is a multiple of four.
+        while len(self.buf) % 4:
+            self.buf.append(0)
+        return insn
+
+    def tableswitch(self, default_label, low, labels):
+        """Emit an aligned tableswitch covering consecutive keys low..high;
+        `labels[i]` is the branch target for key `low + i`."""
+        insn = self._switch_pad(0xAA)
+        self.fixups.append((len(self.buf), insn, default_label, 4))
+        self.buf += b"\x00" * 4  # default
+        high = low + len(labels) - 1
+        self.buf += low.to_bytes(4, "big", signed=True)
+        self.buf += high.to_bytes(4, "big", signed=True)
+        for label in labels:
+            self.fixups.append((len(self.buf), insn, label, 4))
+            self.buf += b"\x00" * 4
+        return self
+
+    def lookupswitch(self, default_label, cases):
+        """Emit an aligned lookupswitch; `cases` is a list of (key, label)
+        pairs, already sorted ascending by key."""
+        insn = self._switch_pad(0xAB)
+        self.fixups.append((len(self.buf), insn, default_label, 4))
+        self.buf += b"\x00" * 4  # default
+        self.buf += len(cases).to_bytes(4, "big", signed=True)
+        for match, label in cases:
+            self.buf += match.to_bytes(4, "big", signed=True)
+            self.fixups.append((len(self.buf), insn, label, 4))
+            self.buf += b"\x00" * 4
+        return self
+
     def build(self):
         for pos, insn, label, width in self.fixups:
             off = self.labels[label] - insn

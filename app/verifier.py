@@ -4,7 +4,7 @@ Implements a work-queue data-flow verifier in the spirit of the classic JVM
 type-inference verifier, over a deliberately small instruction set:
 
   * constants / loads / stores (int + reference), iinc, iadd & friends
-  * branches (if*, goto, goto_w)
+  * branches (if*, goto, goto_w, tableswitch)
   * object creation: new, dup, invokespecial <init>
   * athrow, return, and the Code exception table
 
@@ -173,6 +173,66 @@ _FORMATS = {
 _SIZES = {"b": 2, "u1": 2, "s2": 3, "cp1": 2, "cp2": 3, "iinc": 3,
           "br2": 3, "br4": 5}
 
+# tableswitch/lookupswitch are variable-length: padding aligns their operand
+# block to a 4-byte boundary measured from the start of the code array.
+_SWITCH_OPS = {0xAA: "tableswitch", 0xAB: "lookupswitch"}
+
+
+def _decode_switch(code: bytes, pc: int, op: int) -> Insn:
+    n = len(code)
+    name = _SWITCH_OPS[op]
+    pad = (-(pc + 1)) % 4
+    fixed = 1 + pad + (12 if op == 0xAA else 8)
+
+    def need(size):
+        if pc + size > n:
+            raise VerifyError(
+                pc, "truncated-instruction",
+                f"instruction {name} at offset {pc} needs {size} byte(s), "
+                f"only {n - pc} remain in the code array")
+
+    def s32(rel):
+        return int.from_bytes(code[rel:rel + 4], "big", signed=True)
+
+    need(fixed)
+    base = pc + 1 + pad
+    default = s32(base)
+    if op == 0xAA:
+        low = s32(base + 4)
+        high = s32(base + 8)
+        if low > high:
+            raise VerifyError(
+                pc, "malformed-tableswitch",
+                f"tableswitch low value ({low}) is greater than high value "
+                f"({high})")
+        count = high - low + 1
+        size = fixed + 4 * count
+        need(size)
+        jumps = tuple(s32(base + 12 + 4 * i) for i in range(count))
+        operands = (default, low, high, jumps)
+    else:
+        npairs = s32(base + 4)
+        if npairs < 0:
+            raise VerifyError(
+                pc, "malformed-lookupswitch",
+                f"lookupswitch npairs is negative ({npairs})")
+        size = fixed + 8 * npairs
+        need(size)
+        pairs = []
+        prev = None
+        for i in range(npairs):
+            match = s32(base + 8 + 8 * i)
+            rel = s32(base + 12 + 8 * i)
+            if prev is not None and match <= prev:
+                raise VerifyError(
+                    pc, "malformed-lookupswitch",
+                    f"lookupswitch match values must be distinct and sorted "
+                    f"ascending; {match:#x} follows {prev:#x}")
+            prev = match
+            pairs.append((match, rel))
+        operands = (default, npairs, tuple(pairs))
+    return Insn(pc, op, name, operands, size)
+
 
 def decode(code: bytes) -> dict:
     """Linear-sweep decode; every offset in `code` is covered exactly once."""
@@ -184,6 +244,11 @@ def decode(code: bytes) -> dict:
         if op in _SIMPLE:
             insns[off] = Insn(off, op, _SIMPLE[op], (), 1)
             off += 1
+            continue
+        if op in _SWITCH_OPS:
+            insn = _decode_switch(code, off, op)
+            insns[off] = insn
+            off += insn.size
             continue
         spec = _FORMATS.get(op)
         if spec is None:
@@ -340,6 +405,19 @@ def disasm(insn: Insn, cf: ClassFile) -> str:
         if n == "invokespecial":
             cls, name, desc = cp_methodref(cf, insn.operands[0], insn.offset)
             return f"invokespecial {cls}.{name}{desc}"
+        if n == "tableswitch":
+            default, low, _high, jumps = insn.operands
+            targets = ", ".join(
+                f"{low + i}->{insn.offset + rel}"
+                for i, rel in enumerate(jumps))
+            return (f"tableswitch default->{insn.offset + default} "
+                    f"[{targets}]")
+        if n == "lookupswitch":
+            default, _npairs, pairs = insn.operands
+            matches = ", ".join(
+                f"{match}->{insn.offset + rel}" for match, rel in pairs)
+            return (f"lookupswitch default->{insn.offset + default} "
+                    f"[{matches}]")
     except VerifyError:
         return f"{n} #{insn.operands[0]}"
     return n
@@ -625,6 +703,33 @@ class MethodVerifier:
             return via_branch()
         if n in ("goto", "goto_w"):
             return [(branch_target(), out())]
+
+        # -- switches: the int selector is consumed and the post-pop frame
+        # flows to every case target and to the default target (there is no
+        # fall-through successor).
+        if n in ("tableswitch", "lookupswitch"):
+            pop_int()
+            f = out()
+
+            def switch_target(rel, what):
+                t = pc + rel
+                if t not in self.insns:
+                    err("bad-branch-target",
+                        f"{n} {what} targets offset {t}, which is not the "
+                        f"start of an instruction")
+                return t
+
+            if n == "tableswitch":
+                default, low, _high, jumps = insn.operands
+                edges = [(switch_target(default, "default"), f)]
+                edges += [(switch_target(rel, f"case {low + i}"), f)
+                          for i, rel in enumerate(jumps)]
+            else:
+                default, _npairs, pairs = insn.operands
+                edges = [(switch_target(default, "default"), f)]
+                edges += [(switch_target(rel, f"case {match}"), f)
+                          for match, rel in pairs]
+            return edges
 
         # -- object creation / initialization
         if n == "new":
